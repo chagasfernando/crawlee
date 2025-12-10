@@ -1,32 +1,18 @@
 from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
-import asyncio
+import yfinance as yf
 from datetime import datetime, timedelta
+import pandas as pd
 
-# Use tvdatafeed for reliable TradingView data extraction
-from tvDatafeed import TvDatafeed, Interval
-
-app = FastAPI(title="TradingView Scraper Service")
-
-# CORS for Supabase Edge Functions
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = FastAPI()
 
 class ScrapeRequest(BaseModel):
-    url: str
     symbol: str
-    timeframe: str = "2m"
-    limit: int = 100
-    historical_days: int = 7
+    tradingview_url: Optional[str] = None
+    config: Optional[dict] = None
 
-class CandleData(BaseModel):
+class Candle(BaseModel):
     timestamp: str
     open: float
     high: float
@@ -38,139 +24,102 @@ class CandleData(BaseModel):
 class ScrapeResponse(BaseModel):
     success: bool
     symbol: str
-    candles: List[CandleData]
-    message: Optional[str] = None
+    candles: List[Candle]
+    timestamp: str
+    source: str
 
-# Map timeframe strings to tvdatafeed intervals
-INTERVAL_MAP = {
-    "1m": Interval.in_1_minute,
-    "2m": Interval.in_1_minute,  # tvdatafeed doesn't have 2m, use 1m
-    "5m": Interval.in_5_minute,
-    "15m": Interval.in_15_minute,
-    "30m": Interval.in_30_minute,
-    "1h": Interval.in_1_hour,
-    "4h": Interval.in_4_hour,
-    "1d": Interval.in_daily,
+# Mapeamento de símbolos TradingView -> Yahoo Finance
+SYMBOL_MAP = {
+    "WINZ25": "WIN=F",      # Mini Índice Futuro
+    "WINZ2025": "WIN=F",
+    "WIN1!": "WIN=F",
+    "WDOG25": "WDO=F",      # Mini Dólar Futuro
+    "PETR4": "PETR4.SA",
+    "VALE3": "VALE3.SA",
+    "ITUB4": "ITUB4.SA",
+    "BBDC4": "BBDC4.SA",
 }
 
+def get_yahoo_symbol(tv_symbol: str) -> str:
+    """Converte símbolo TradingView para Yahoo Finance"""
+    # Remove prefixos comuns
+    clean = tv_symbol.replace("BMFBOVESPA-", "").replace("BMFBOVESPA:", "")
+    return SYMBOL_MAP.get(clean, f"{clean}.SA")
+
 def classify_candle(open_price: float, high: float, low: float, close: float) -> str:
-    """Classify candle type based on body size and direction"""
-    body_size = abs(close - open_price)
+    """Classifica o tipo de candle baseado em padrões"""
+    body = abs(close - open_price)
     total_range = high - low
     
     if total_range == 0:
-        return "exhaustion"
+        return "doji"
     
-    body_ratio = body_size / total_range
-    is_bullish = close > open_price
+    body_ratio = body / total_range
     
-    if body_ratio > 0.7:
-        return "bull-strong" if is_bullish else "bear-strong"
-    elif body_ratio > 0.4:
-        return "bull-weak" if is_bullish else "bear-weak"
-    elif body_ratio < 0.2:
-        return "exhaustion"
+    if body_ratio < 0.1:
+        return "doji"
+    elif close > open_price:
+        if body_ratio > 0.7:
+            return "strong_buyer"
+        else:
+            return "weak_buyer"
     else:
-        return "reversal"
-
-@app.get("/")
-async def root():
-    return {"status": "ok", "service": "TradingView Scraper", "version": "2.0"}
-
-@app.get("/health")
-async def health():
-    return {"status": "healthy"}
+        if body_ratio > 0.7:
+            return "strong_seller"
+        else:
+            return "weak_seller"
 
 @app.post("/scrape", response_model=ScrapeResponse)
-async def scrape(request: ScrapeRequest):
+async def scrape_tradingview(request: ScrapeRequest):
     try:
-        # Initialize tvdatafeed (no login for basic data)
-        tv = TvDatafeed()
+        yahoo_symbol = get_yahoo_symbol(request.symbol)
+        print(f"Fetching {yahoo_symbol} from Yahoo Finance (original: {request.symbol})")
         
-        # Parse symbol for B3 (Brazilian exchange)
-        # WINZ25 -> WIN (continuous contract symbol)
-        symbol = request.symbol.upper()
+        # Configurar período
+        period = "5d"  # últimos 5 dias
+        interval = "2m"  # candles de 2 minutos
         
-        # Map B3 mini-index symbols
-        exchange = "BMFBOVESPA"
+        if request.config:
+            tf = request.config.get("timeframe", "2m")
+            interval = tf if tf in ["1m", "2m", "5m", "15m", "30m", "1h"] else "2m"
         
-        # For futures contracts like WINZ25, extract base symbol
-        if symbol.startswith("WIN"):
-            tv_symbol = "WIN1!"  # Continuous mini-index contract
-        elif symbol.startswith("WDO"):
-            tv_symbol = "WDO1!"  # Continuous mini-dollar contract
-        else:
-            tv_symbol = symbol
+        # Buscar dados
+        ticker = yf.Ticker(yahoo_symbol)
+        df = ticker.history(period=period, interval=interval)
         
-        # Get interval
-        interval = INTERVAL_MAP.get(request.timeframe, Interval.in_1_minute)
+        if df.empty:
+            raise HTTPException(status_code=404, detail=f"Nenhum dado encontrado para {yahoo_symbol}")
         
-        # Calculate number of bars needed
-        # For 2-minute timeframe with 7 days: ~7 * 4.5 hours * 30 candles/hour = ~945 candles
-        bars_per_day = 270  # ~9 hours trading session / 2 min
-        n_bars = min(request.historical_days * bars_per_day, 5000)
-        
-        print(f"Fetching {n_bars} bars for {tv_symbol} on {exchange}")
-        
-        # Fetch historical data
-        df = tv.get_hist(
-            symbol=tv_symbol,
-            exchange=exchange,
-            interval=interval,
-            n_bars=n_bars,
-            fut_contract=1  # Use front month contract
-        )
-        
-        if df is None or df.empty:
-            return ScrapeResponse(
-                success=False,
-                symbol=request.symbol,
-                candles=[],
-                message="No data returned from TradingView"
-            )
-        
-        # Convert DataFrame to candle list
         candles = []
         for idx, row in df.iterrows():
-            timestamp = idx if isinstance(idx, datetime) else datetime.fromisoformat(str(idx))
-            
-            candle = CandleData(
-                timestamp=timestamp.isoformat(),
-                open=float(row['open']),
-                high=float(row['high']),
-                low=float(row['low']),
-                close=float(row['close']),
-                volume=int(row['volume']) if 'volume' in row else 0,
-                candle_type=classify_candle(
-                    float(row['open']),
-                    float(row['high']),
-                    float(row['low']),
-                    float(row['close'])
-                )
-            )
-            candles.append(candle)
+            candle_type = classify_candle(row["Open"], row["High"], row["Low"], row["Close"])
+            candles.append(Candle(
+                timestamp=idx.isoformat(),
+                open=round(row["Open"], 2),
+                high=round(row["High"], 2),
+                low=round(row["Low"], 2),
+                close=round(row["Close"], 2),
+                volume=int(row["Volume"]),
+                candle_type=candle_type
+            ))
         
-        print(f"Successfully extracted {len(candles)} candles")
+        # Limitar a 100 candles mais recentes
+        candles = candles[-100:]
+        
+        print(f"Returning {len(candles)} candles for {yahoo_symbol}")
         
         return ScrapeResponse(
             success=True,
             symbol=request.symbol,
             candles=candles,
-            message=f"Extracted {len(candles)} candles from TradingView"
+            timestamp=datetime.now().isoformat(),
+            source="yahoo_finance"
         )
         
     except Exception as e:
-        print(f"Error scraping: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        
-        return ScrapeResponse(
-            success=False,
-            symbol=request.symbol,
-            candles=[],
-            message=f"Error: {str(e)}"
-        )
+        print(f"Error fetching data: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+@app.get("/health")
+async def health():
+    return {"status": "healthy", "source": "yahoo_finance"}
