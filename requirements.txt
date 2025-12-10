@@ -1,5 +1,6 @@
 fastapi>=0.104.0
 uvicorn>=0.24.0
 pydantic>=2.6.3
-git+https://github.com/StreamAlpha/tvdatafeed.git
+git+https://github.com/rongardF/tvdatafeed.git
 pandas>=2.0.0
+
