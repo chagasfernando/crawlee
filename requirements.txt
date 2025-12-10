@@ -1,4 +1,5 @@
 fastapi>=0.104.0
 uvicorn>=0.24.0
 pydantic>=2.6.3
-crawlee[playwright]>=0.2.0
+tvdatafeed>=2.1.0
+pandas>=2.0.0
