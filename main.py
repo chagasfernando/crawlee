@@ -6,7 +6,7 @@ import asyncio
 from datetime import datetime, timedelta
 
 # Use tvdatafeed for reliable TradingView data extraction
-from tvdatafeed import TvDatafeed, Interval
+from tvDatafeed import TvDatafeed, Interval
 
 app = FastAPI(title="TradingView Scraper Service")
 
